@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WebGPU &amp; TSL hero</title>
+    <link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+    <canvas class="js-canvas webgl"></canvas>
+
+    <div class="js-unsupported unsupported" hidden>
+        <p>Нужен WebGPU.</p>
+        <p class="hint">Откройте в Chrome или Edge — симуляция пишет в чужие элементы storage-буферов, на WebGL это не работает.</p>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>
