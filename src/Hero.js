@@ -5,11 +5,12 @@ import {
     color, deltaTime, dot, float, hash, instancedArray, instanceIndex,
     luminance, pass, positionLocal, uint, uniform, vec3
 } from 'three/tsl'
+import { loadFaceTargets } from './faceTargets.js'
 
 /**
- * Облако сфер, стянутое к центру, сталкивающееся само с собой и разлетающееся от курсора.
- * Позиции, скорости и «нагрев» живут в storage-буферах, вся симуляция — один TSL
- * compute-шейдер на кадр.
+ * Облако сфер, собирающееся в лицо: каждая частица летит к своей точке на скане головы и
+ * несёт цвет из фотографии, спроецированной на эту голову спереди. Позиции, скорости и
+ * «нагрев» живут в storage-буферах, вся симуляция — один TSL compute-шейдер на кадр.
  *
  * Только WebGPU: цикл коллизий пишет в элементы буферов, принадлежащие другим частицам.
  * WebGL-бэкенд реализует compute() через transform feedback и такое не поддерживает —
@@ -23,6 +24,11 @@ export default class Hero
         this.count = _options.count
 
         this.playing = false
+
+        // Разброс по глубине между самым тёмным и самым светлым пикселем. Небо на
+        // снимке светлее лица, так что сильный рельеф выпячивает фон вперёд — отсюда
+        // сдержанное значение.
+        this.depth = 0.9
 
         this.tick = this.tick.bind(this)
         this.resize = this.resize.bind(this)
@@ -40,12 +46,57 @@ export default class Hero
         this.setCamera()
         this.setLights()
         this.setCursor()
+        await this.setFace()
         this.setParticles()
         this.setPostProcessing()
 
         this.resize()
 
         window.addEventListener('resize', this.resize)
+    }
+
+    /**
+     * Сетка редко делится на запрошенное число нацело — частиц ровно столько, сколько
+     * в ней ячеек, иначе хвост буфера остался бы в нуле и слипся в точку
+     */
+    async setFace()
+    {
+        this.face = await loadFaceTargets({ count: this.count, photoUrl: '/face.jpg' })
+        this.sampled = this.face.build(this.depth, this.sceneHeight())
+        this.count = this.sampled.count
+    }
+
+    /**
+     * Снимок занимает всю видимую высоту, ширина следует за его пропорциями. Величина
+     * зависит только от угла и удаления камеры, а они постоянны, поэтому от формы окна
+     * раскладка не зависит и на ресайзе не пересобирается.
+     */
+    sceneHeight()
+    {
+        return 2 * this.camera.position.z * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2)
+    }
+
+    /** Плотный массив по три числа на частицу — в буфер с шагом в четыре */
+    writeVec3(buffer, source, length = this.count)
+    {
+        const target = buffer.value.array
+
+        for(let i = 0; i < length; i++)
+        {
+            target[i * 4 + 0] = source[i * 3 + 0]
+            target[i * 4 + 1] = source[i * 3 + 1]
+            target[i * 4 + 2] = source[i * 3 + 2]
+        }
+
+        buffer.value.needsUpdate = true
+    }
+
+    /** Пересбор целей под новую глубину. Цвета не трогаются — они привязаны к пикселю */
+    rebuildFace()
+    {
+        const sampled = this.face.build(this.depth, this.sceneHeight())
+
+        this.writeVec3(this.targetsBuffer, sampled.positions, Math.min(sampled.count, this.count))
     }
 
     setSizes()
@@ -155,10 +206,26 @@ export default class Hero
         this.velocitiesBuffer = instancedArray(count, 'vec3')
         this.heatBuffer = instancedArray(count, 'float')
 
+        // vec4, а не vec3: эти два буфера заполняются с CPU, а у vec3 в WGSL шаг 16 байт
+        // против 12 у плотного массива на стороне JS. Четвёртый компонент не используется.
+        this.targetsBuffer = instancedArray(count, 'vec4')
+        this.colorsBuffer = instancedArray(count, 'vec4')
+
+        this.writeVec3(this.targetsBuffer, this.sampled.positions)
+        this.writeVec3(this.colorsBuffer, this.sampled.colors)
+
         this.uniforms = {
-            radius: uniform(0.1),
-            contactRadius: uniform(0.13),
+            // Оба радиуса привязаны к шагу сетки целей. Видимый чуть больше половины
+            // шага, чтобы сферы перекрыли диагональные просветы и кожа стала сплошной.
+            // Контактный - чуть меньше половины: в покое соседи не дотягиваются друг до
+            // друга, цикл коллизий простаивает и не сдвигает частицы с их пикселей.
+            radius: uniform(this.sampled.spacing * 1.05),
+            contactRadius: uniform(this.sampled.spacing * 0.46),
             gravityStrength: uniform(0.025),
+            pullRange: uniform(1.5),
+            // Сцена освещена слабо, и на одном Lambert фотография уходит в темноту.
+            // Выше ~0.3 снимок с жёстким солнцем пересвечивается в белое пятно.
+            photoGlow: uniform(0.25),
             impactDamping: uniform(0.05),
             generalDamping: uniform(0.4),
             heatDamping: uniform(3),
@@ -218,8 +285,16 @@ export default class Hero
             aVelocity.addAssign(cursorPush)
             aHeat.addAssign(cursorPush.length().mul(u.cursorHeatStrength))
 
-            // Гравитация к центру
-            aVelocity.addAssign(aPosition.negate().normalize().mul(u.gravityStrength).mul(clampedDeltaTime))
+            // Притяжение к своей точке на лице. Сила растёт с расстоянием и упирается в
+            // потолок: вдали это тяга к цели, вблизи — пружина, гасящая перелёт
+            const toTarget = this.targetsBuffer.element(instanceIndex).xyz.sub(aPosition)
+            const targetDistance = toTarget.length()
+            aVelocity.addAssign(
+                toTarget.div(targetDistance.max(EPSILON))
+                    .mul(targetDistance.min(u.pullRange))
+                    .mul(u.gravityStrength)
+                    .mul(clampedDeltaTime)
+            )
 
             // Коллизии: каждая нить обрабатывает пары (instanceIndex, i > instanceIndex),
             // так каждая пара считается один раз
@@ -272,10 +347,18 @@ export default class Hero
             return positionLocal
         })()
 
-        // Нормируем по яркости, чтобы ползунок нагрева задавал силу, а не оттенок
-        this.material.emissiveNode = u.emissiveColor
-            .div(luminance(u.emissiveColor))
-            .mul(this.heatBuffer.element(instanceIndex))
+        // Цвет частицы — её пиксель фотографии
+        const photoColor = this.colorsBuffer.element(instanceIndex).xyz
+        this.material.colorNode = photoColor
+
+        // Фото подсвечено само по себе: сцена освещена слабо, и на одном Lambert лицо
+        // ушло бы в темноту. Нагрев от ударов ложится оранжевым поверх, нормированный по
+        // яркости, чтобы ползунок задавал силу, а не оттенок.
+        this.material.emissiveNode = photoColor.mul(u.photoGlow).add(
+            u.emissiveColor
+                .div(luminance(u.emissiveColor))
+                .mul(this.heatBuffer.element(instanceIndex))
+        )
 
         this.mesh = new THREE.Mesh(this.geometry, this.material)
         this.mesh.castShadow = true

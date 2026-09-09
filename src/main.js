@@ -14,8 +14,10 @@ else
 {
     const { default: Hero } = await import('./Hero.js')
 
-    // 6000 частиц — это ~18M проверок пар на кадр. На слабой GPU снижаем через ?count=
-    const count = Number(new URLSearchParams(window.location.search).get('count')) || 6000
+    // Частицы здесь работают пикселями портрета, и на 6000 черт лица уже не разобрать.
+    // Цена — квадратичный цикл коллизий: 16000 это ~128M проверок пар на кадр,
+    // на слабой GPU снижаем через ?count=
+    const count = Number(new URLSearchParams(window.location.search).get('count')) || 16000
 
     const hero = new Hero({ $canvas, count })
     await hero.init()

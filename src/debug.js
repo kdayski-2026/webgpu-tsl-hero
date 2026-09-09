@@ -24,10 +24,15 @@ export function attachDebug(hero)
     const gui = new GUI({ width: 320 })
     const u = hero.uniforms
 
+    const photo = gui.addFolder('Photo')
+    photo.add(hero, 'depth', 0, 5, 0.05).name('depth').onChange(() => hero.rebuildFace())
+    photo.add(u.photoGlow, 'value', 0, 2, 0.01).name('photoGlow')
+
     const spheres = gui.addFolder('Spheres')
-    spheres.add(u.radius, 'value', 0, 0.5, 0.001).name('radius')
-    spheres.add(u.contactRadius, 'value', 0, 0.5, 0.001).name('contactRadius')
-    spheres.add(u.gravityStrength, 'value', 0, 0.1, 0.001).name('gravityStrength')
+    spheres.add(u.radius, 'value', 0, 0.3, 0.001).name('radius')
+    spheres.add(u.contactRadius, 'value', 0, 0.3, 0.001).name('contactRadius')
+    spheres.add(u.gravityStrength, 'value', 0, 0.2, 0.001).name('gravityStrength')
+    spheres.add(u.pullRange, 'value', 0.1, 5, 0.01).name('pullRange')
     spheres.add(u.impactDamping, 'value', 0, 1, 0.001).name('impactDamping')
     spheres.add(u.generalDamping, 'value', 0, 1, 0.01).name('generalDamping')
 
